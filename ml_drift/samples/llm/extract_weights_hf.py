@@ -15,6 +15,7 @@
 """Extracts weights from a HuggingFace model into separate binary files."""
 
 import argparse
+import json
 import os
 from typing import Optional, Tuple
 
@@ -39,10 +40,20 @@ def get_output_filename(key: str) -> str:
     return key + ".bin"
 
 
+def get_qwen35_text_tensor_name(key: str) -> Optional[str]:
+  """Maps Qwen3.5 text parameters to runner names and excludes non-text modules."""
+  if key.startswith(("model.visual.", "mtp.")):
+    return None
+  prefix = "model.language_model."
+  if key.startswith(prefix):
+    return "model." + key[len(prefix) :]
+  return key
+
+
 def get_layer_type(layer_name: str) -> str:
   """Gets the layer category for a given layer name."""
   ffn_layers = ["mlp"]
-  attn_layers = ["self_attn"]
+  attn_layers = ["self_attn", "linear_attn"]
   emb_layers = ["embed_tokens", "embedder", "lm_head"]
   layer_norms = [
       "input_layernorm",
@@ -51,6 +62,7 @@ def get_layer_type(layer_name: str) -> str:
       "model.norm.weight",
       "pre_feedforward_layernorm",
       "post_feedforward_layernorm",
+      "linear_attn.norm",
   ]
   lora_layers = ["lora"]
   skip_layers = ["multi_modal_projector", "vision_tower"]
@@ -59,14 +71,14 @@ def get_layer_type(layer_name: str) -> str:
     return "SKIP"
   if any(sub_name in layer_name for sub_name in lora_layers):
     return "LORA"
+  if any(sub_name in layer_name for sub_name in layer_norms):
+    return "LAYER_NORM"
   if any(sub_name in layer_name for sub_name in attn_layers):
     return "ATTENTION"
   if any(sub_name in layer_name for sub_name in ffn_layers):
     return "FEEDFORWARD"
   if any(sub_name in layer_name for sub_name in emb_layers):
     return "EMBEDDING"
-  if any(sub_name in layer_name for sub_name in layer_norms):
-    return "LAYER_NORM"
   return "NONE"
 
 
@@ -305,6 +317,18 @@ def extract_model_weights(
 
   layer_info = []
 
+  model_directory = (
+      model_path if os.path.isdir(model_path) else os.path.dirname(model_path)
+  )
+  config_path = os.path.join(model_directory, "config.json")
+  is_qwen35_config = False
+  if os.path.isfile(config_path):
+    with open(config_path, encoding="utf-8") as config_file:
+      is_qwen35_config = json.load(config_file).get("model_type") in (
+          "qwen3_5",
+          "qwen3_5_text",
+      )
+
   for cur_model_path in model_files:
     print(f"\nLoading model from: {cur_model_path}")
     state_dict = {}
@@ -331,7 +355,14 @@ def extract_model_weights(
 
     print(f"Found {len(state_dict)} tensors to process.")
 
+    is_qwen35 = is_qwen35_config or any(
+      ".linear_attn." in key for key in state_dict
+    )
     for i, (key, tensor) in enumerate(state_dict.items()):
+      if is_qwen35:
+        key = get_qwen35_text_tensor_name(key)
+        if key is None:
+          continue
       tensor_np = tensor.float().numpy()
       layer_type = get_layer_type(key)
 
@@ -341,6 +372,7 @@ def extract_model_weights(
           quantize_enabled
           and layer_type not in ("LAYER_NORM", "LORA", "SKIP", "NONE")
           and key.endswith(".weight")
+          and tensor_np.ndim == 2
       ):
         if layer_type == "FEEDFORWARD":
           quant_bits = feedforward_quant_bits

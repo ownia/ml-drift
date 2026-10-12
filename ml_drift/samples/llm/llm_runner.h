@@ -82,6 +82,7 @@ class Tokenizer {
           absl::StrCat("Tokenizer file is empty: ", model_path));
     }
     switch (model_type_) {
+      case ModelType::kQwen35:
       case ModelType::kQwen3: {
         tokenizer_json_ = tokenizers::Tokenizer::FromBlobJSON(*model_blob);
         if (!tokenizer_json_) {
@@ -89,7 +90,8 @@ class Tokenizer {
               "Failed to parse JSON tokenizer from: ", model_path));
         }
         // bos_id_ not used
-        eos_id_ = tokenizer_json_->TokenToId("<|im_end|>");
+        eos_id_ = tokenizer_json_->TokenToId(
+          model_type_ == ModelType::kQwen35 ? "<|endoftext|>" : "<|im_end|>");
         end_of_turn_id_ = tokenizer_json_->TokenToId("<|im_end|>");
         break;
       }
@@ -127,10 +129,14 @@ class Tokenizer {
     std::string templated_input = input_text;
     if (apply_chat_template) {
       switch (model_type_) {
+        case ModelType::kQwen35:
         case ModelType::kQwen3:
           templated_input = absl::StrCat("<|im_start|>user\n", templated_input);
           absl::StrAppend(&templated_input, "<|im_end|>\n");
           absl::StrAppend(&templated_input, "<|im_start|>assistant\n");
+          if (model_type_ == ModelType::kQwen35) {
+            absl::StrAppend(&templated_input, "<think>\n\n</think>\n\n");
+          }
           break;
         case ModelType::kGemma4:
           templated_input = absl::StrCat("<|turn>user\n", templated_input);
@@ -147,7 +153,8 @@ class Tokenizer {
     }
 
     std::vector<int> input_tokens;
-    if (model_type_ == ModelType::kQwen3 || model_type_ == ModelType::kGemma4) {
+    if (model_type_ == ModelType::kQwen3 || model_type_ == ModelType::kQwen35 ||
+      model_type_ == ModelType::kGemma4) {
       std::vector<int32_t> input_tokens_i32 =
           tokenizer_json_->Encode(templated_input);
       input_tokens.assign(input_tokens_i32.begin(), input_tokens_i32.end());
@@ -165,6 +172,7 @@ class Tokenizer {
   std::string DecodeOutputTokens(const std::vector<int>& output_tokens_vec) {
     std::string decoded_text;
     switch (model_type_) {
+      case ModelType::kQwen35:
       case ModelType::kQwen3:
       case ModelType::kGemma4: {
         std::vector<int32_t> output_tokens_i32(output_tokens_vec.begin(),

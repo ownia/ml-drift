@@ -37,6 +37,133 @@
 namespace ml_drift {
 namespace {
 
+TEST(Qwen3ModelBuilderTest, Qwen35ModelConfig0_8B) {
+  auto model_info = GetModelInfo("qwen3.5:0.8b");
+  ASSERT_TRUE(model_info.ok());
+  EXPECT_EQ(model_info->type, ModelType::kQwen35);
+  EXPECT_STREQ(GetTokenizerFilename(model_info->type), "tokenizer.json");
+  const LlmConfig& config = model_info->config;
+  EXPECT_EQ(config.model_dimension, 1024);
+  EXPECT_EQ(config.hidden_dimension, 3584);
+  EXPECT_EQ(config.head_dimension, 256);
+  EXPECT_EQ(config.number_of_heads, 8);
+  EXPECT_EQ(config.number_of_kv_heads, 2);
+  EXPECT_EQ(config.vocabulary_size, 248320);
+  EXPECT_EQ(config.stack_size, 24);
+  ASSERT_TRUE(config.qwen35.has_value());
+  EXPECT_EQ(config.qwen35->full_attention_interval, 4);
+  EXPECT_EQ(config.qwen35->linear_conv_kernel_dim, 4);
+  EXPECT_EQ(config.qwen35->linear_key_head_dim, 128);
+  EXPECT_EQ(config.qwen35->linear_num_key_heads, 16);
+  EXPECT_EQ(config.qwen35->linear_num_value_heads, 16);
+  EXPECT_EQ(config.qwen35->linear_value_head_dim, 128);
+  EXPECT_FLOAT_EQ(config.qwen35->rope_theta, 10000000.0f);
+  EXPECT_FLOAT_EQ(config.qwen35->partial_rotary_factor, 0.25f);
+}
+
+TEST(Qwen3ModelBuilderTest, BuildQwen35FullAttentionWithFloatWeights) {
+  GpuInfo gpu_info;
+  gpu_info.gpu_api = GpuApi::kWebGpu;
+  CreateGpuModelInfo create_info;
+  create_info.precision = CalculationsPrecision::kF32;
+  create_info.storage_type = TensorStorageType::kBuffer;
+  LlmConfig config = GetQwen35ModelConfig0_8B();
+  config.sequence_size = 4;
+  config.model_dimension = 64;
+  config.hidden_dimension = 128;
+  config.head_dimension = 32;
+  config.number_of_heads = 4;
+  config.number_of_kv_heads = 1;
+  config.vocabulary_size = 100;
+  config.stack_size = 1;
+  config.cache_size = 16;
+  config.qwen35->full_attention_interval = 1;
+
+  std::vector<std::unique_ptr<DummyGpuSpatialTensor>> allocated_tensors;
+  auto dummy_loader = std::make_unique<LlmDummyTensorLoader>(-1, 32);
+  dummy_loader->SetCreateTensorFn(
+      [&allocated_tensors](const TensorDescriptor& desc)
+          -> absl::StatusOr<GpuSpatialTensor*> {
+        allocated_tensors.push_back(
+            std::make_unique<DummyGpuSpatialTensor>(desc));
+        return allocated_tensors.back().get();
+      });
+  Qwen3ModelBuilder builder(
+      config, gpu_info, create_info,
+      LlmTensorLoader::MakeCaching(std::move(dummy_loader)));
+  GpuModel prefill_model;
+  GpuModel decode_model;
+  GpuModelBuilder::TensorHandle input, decode_input, params, output, decode_output;
+  std::vector<GpuModelBuilder::TensorHandle> k_caches, v_caches;
+  const absl::Status status = builder.Build(
+      &prefill_model, &decode_model, &input, &decode_input, &params, &output,
+      &decode_output, &k_caches, &v_caches);
+  ASSERT_TRUE(status.ok()) << status;
+  EXPECT_FALSE(prefill_model.nodes.empty());
+  EXPECT_FALSE(decode_model.nodes.empty());
+  EXPECT_EQ(output.tensor_desc.GetBHWCShape(), BHWC(1, 1, 1, 100));
+  EXPECT_EQ(k_caches.size(), 1);
+  EXPECT_EQ(v_caches.size(), 1);
+}
+
+TEST(Qwen3ModelBuilderTest, BuildQwen35HybridModel) {
+  for (int weight_bits : {32, 8, 4}) {
+    SCOPED_TRACE(weight_bits);
+    GpuInfo gpu_info;
+    gpu_info.gpu_api = GpuApi::kWebGpu;
+    CreateGpuModelInfo create_info;
+    create_info.precision = CalculationsPrecision::kF32;
+    create_info.storage_type = TensorStorageType::kBuffer;
+    LlmConfig config = GetQwen35ModelConfig0_8B();
+    config.sequence_size = 4;
+    config.model_dimension = 64;
+    config.hidden_dimension = 128;
+    config.head_dimension = 32;
+    config.number_of_heads = 4;
+    config.number_of_kv_heads = 1;
+    config.vocabulary_size = 100;
+    config.stack_size = 4;
+    config.cache_size = 16;
+    config.qwen35->linear_key_head_dim = 16;
+    config.qwen35->linear_value_head_dim = 16;
+    config.qwen35->linear_num_key_heads = 2;
+    config.qwen35->linear_num_value_heads = 4;
+
+    std::vector<std::unique_ptr<DummyGpuSpatialTensor>> allocated_tensors;
+    auto dummy_loader = std::make_unique<LlmDummyTensorLoader>(-1, weight_bits);
+    dummy_loader->SetCreateTensorFn(
+        [&allocated_tensors](const TensorDescriptor& desc)
+            -> absl::StatusOr<GpuSpatialTensor*> {
+          allocated_tensors.push_back(
+              std::make_unique<DummyGpuSpatialTensor>(desc));
+          return allocated_tensors.back().get();
+        });
+    Qwen3ModelBuilder builder(
+        config, gpu_info, create_info,
+        LlmTensorLoader::MakeCaching(std::move(dummy_loader)));
+    GpuModel prefill_model;
+    GpuModel decode_model;
+    GpuModelBuilder::TensorHandle input, decode_input, params, output, decode_output;
+    std::vector<GpuModelBuilder::TensorHandle> k_caches, v_caches;
+    const absl::Status status = builder.Build(
+        &prefill_model, &decode_model, &input, &decode_input, &params, &output,
+        &decode_output, &k_caches, &v_caches);
+    ASSERT_TRUE(status.ok()) << status;
+    ASSERT_EQ(k_caches.size(), 4);
+    ASSERT_EQ(v_caches.size(), 4);
+    for (int layer = 0; layer < 3; ++layer) {
+      EXPECT_EQ(k_caches[layer].tensor_desc.GetBHWCShape(), BHWC(1, 1, 3, 128));
+      EXPECT_EQ(v_caches[layer].tensor_desc.GetBHWCShape(), BHWC(1, 4, 16, 16));
+      EXPECT_EQ(v_caches[layer].tensor_desc.GetDataType(), DataType::kFloat32);
+      EXPECT_EQ(prefill_model.tensors.at(v_caches[layer].id),
+                decode_model.tensors.at(v_caches[layer].id));
+    }
+    EXPECT_FALSE(prefill_model.nodes.empty());
+    EXPECT_FALSE(decode_model.nodes.empty());
+    EXPECT_EQ(output.tensor_desc.GetBHWCShape(), BHWC(1, 1, 1, 100));
+  }
+}
+
 TEST(Qwen3ModelBuilderTest, BuildSmallModelWithFakeWeights) {
   GpuInfo gpu_info;
   gpu_info.gpu_api = GpuApi::kWebGpu;

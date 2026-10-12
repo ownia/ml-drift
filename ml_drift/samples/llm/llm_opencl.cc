@@ -209,6 +209,7 @@ absl::Status OpenCLLlmModelRunner::Init(const std::string& weights_path,
   GpuModel prefill_model;
   GpuModel decode_model;
   switch (model_type_) {
+    case ModelType::kQwen35:
     case ModelType::kQwen3: {
       Qwen3ModelBuilder builder(config_, gpu_info, create_info_,
                                 std::move(tensor_loader));
@@ -349,6 +350,7 @@ absl::Status OpenCLLlmModelRunner::InitSliceAndGreedy() {
   GpuModel greedy_model;  // Greedy: Processes the decode output logits.
 
   switch (model_type_) {
+    case ModelType::kQwen35:
     case ModelType::kQwen3: {
       Qwen3ModelBuilder builder(config_, env_->GetDevicePtr()->GetInfo(),
                                 create_info_, nullptr);
@@ -562,7 +564,8 @@ absl::Status OpenCLLlmModelRunner::Decode(const DecodeOptions& options) {
              options.output_tokens->size() > 1)) {
           break;
         }
-        if ((model_type_ == ModelType::kGemma3 ||
+           if ((model_type_ == ModelType::kQwen35 ||
+             model_type_ == ModelType::kGemma3 ||
              model_type_ == ModelType::kGemma4) &&
             current_token == options.tokenizer->end_of_turn_id()) {
           break;
@@ -604,6 +607,12 @@ absl::Status OpenCLLlmModelRunner::PostProcessGreedy(
   ABSL_RETURN_IF_ERROR(
       Prefill(input_tokens_vec, /*download_token=*/true, &first_token))
       << "Error during prefill";
+  if (model_type_ == ModelType::kQwen35 &&
+      (first_token == tokenizer.eos_id() ||
+       first_token == tokenizer.end_of_turn_id())) {
+    std::cout << std::endl;
+    return absl::OkStatus();
+  }
   output_tokens_vec.push_back(first_token);
 
   if (num_gen_tokens <= 1) {

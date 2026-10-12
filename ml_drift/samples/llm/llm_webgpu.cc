@@ -209,6 +209,7 @@ absl::Status WebGpuLlmModelRunner::Init(const std::string& weights_path,
   GpuModel prefill_model;
   GpuModel decode_model;
   switch (model_type_) {
+    case ModelType::kQwen35:
     case ModelType::kQwen3: {
       Qwen3ModelBuilder builder(config_, gpu_info, create_info_,
                                 std::move(tensor_loader));
@@ -345,6 +346,7 @@ absl::Status WebGpuLlmModelRunner::InitSliceAndGreedy() {
   GpuModel greedy_model;  // Greedy: Processes the decode output logits.
 
   switch (model_type_) {
+    case ModelType::kQwen35:
     case ModelType::kQwen3: {
       Qwen3ModelBuilder builder(config_, env_->GetInfo(), create_info_,
                                 nullptr);

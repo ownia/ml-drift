@@ -5,7 +5,7 @@ and an op-level GPU performance profiler for running Large Language Models
 (LLMs) using ML Drift across **Metal**, **WebGPU**, and **OpenCL**.
 
 **Supported Models**: `gemma4:12b`, `gemma3:1b`, `gemma3:270m`, `qwen3:0.6b`,
-`qwen3:1.7b`, `qwen3:8b`.
+`qwen3:1.7b`, `qwen3:8b`, `qwen3.5:0.8b`.
 
 ### Contents
 
@@ -14,8 +14,8 @@ and an op-level GPU performance profiler for running Large Language Models
     graphs using ML Drift `GpuModelBuilder`.
 *   **`gemma3_model_builder.h/.cc`**: Builds Gemma 3 prefill, decode, and greedy
     graphs using ML Drift `GpuModelBuilder`.
-*   **`qwen3_model_builder.h/.cc`**: Builds Qwen 3 prefill, decode, and greedy
-    graphs using ML Drift `GpuModelBuilder`.
+*   **`qwen3_model_builder.h/.cc`**: Builds Qwen 3 and Qwen 3.5 text prefill,
+  decode, and greedy graphs using ML Drift `GpuModelBuilder`.
 *   **`llm_runner.h/.cc`**: Shared runner interface, tokenizer wrapper, CLI
     flags, and generation loop.
 *   **`llm_metal.cc` / `llm_webgpu.cc` / `llm_opencl.cc`**: Backend-specific
@@ -61,6 +61,7 @@ converts and quantizes them into separate binary tensor files for ML Drift.
     *   [Qwen 3 0.6B](https://huggingface.co/Qwen/Qwen3-0.6B/tree/main)
     *   [Qwen 3 1.7B](https://huggingface.co/Qwen/Qwen3-1.7B/tree/main)
     *   [Qwen 3 8B](https://huggingface.co/Qwen/Qwen3-8B/tree/main)
+    *   [Qwen 3.5 0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B/tree/main)
 
 2.  **Run `extract_weights_hf` to generate Q4_0 quantized binary weight files**:
 
@@ -102,7 +103,7 @@ converts and quantizes them into separate binary tensor files for ML Drift.
 
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `--model` | `"none"` | Required. Model to run: `gemma4:12b`, `gemma3:1b`, `gemma3:270m`, `qwen3:0.6b`, `qwen3:1.7b`, or `qwen3:8b`. |
+| `--model` | `"none"` | Required. Model to run: `gemma4:12b`, `gemma3:1b`, `gemma3:270m`, `qwen3:0.6b`, `qwen3:1.7b`, `qwen3:8b`, or `qwen3.5:0.8b`. |
 | `--weights_path` | `""` | Required. Path to the directory containing extracted weight files (and tokenizer by default). |
 | `--tokenizer_path` | `""` | Optional path to the tokenizer file (`tokenizer.model` or `tokenizer.json`). Defaults to `<weights_path>/tokenizer.model` (Gemma) or `<weights_path>/tokenizer.json` (Qwen). |
 | `--prompt` | `""` | Input text prompt to feed into the model (required unless `--prompt_file` or `--benchmark` is set). |
@@ -140,6 +141,36 @@ bazel run -c opt //ml_drift/samples/llm:llm_runner_opencl -- \
   --weights_path=/tmp/extracted/ \
   --prompt="Write a haiku about coffee."
 ```
+
+#### Qwen 3.5 0.8B Text Generation
+
+Qwen 3.5 uses three gated linear-attention layers followed by one full-attention
+layer, with FP32 recurrent state, partial RoPE, and attention output gates. The
+runner uses the checkpoint's non-thinking chat template by default.
+
+Support is text-only: extraction maps `model.language_model.*` tensor names to
+`model.*` and omits the vision encoder and multi-token-prediction (MTP) weights.
+Convolution, normalization, and recurrent decay parameters remain FP32 even
+when dense projections are quantized.
+
+```bash
+bazel run -c opt //ml_drift/samples/llm:extract_weights_hf -- \
+  --model_path=/path/to/Qwen3.5-0.8B \
+  --output_dir=/tmp/qwen35-int8 \
+  --embedding_quant_bits=8 \
+  --attention_quant_bits=8 \
+  --feedforward_quant_bits=8
+
+bazel run -c opt //ml_drift/samples/llm:llm_runner_opencl -- \
+  --model=qwen3.5:0.8b \
+  --weights_path=/tmp/qwen35-int8 \
+  --tokenizer_path=/path/to/Qwen3.5-0.8B/tokenizer.json \
+  --prompt="What is 2 + 2?" \
+  --max_gen_tokens=32
+```
+
+The same model name is registered in the Metal and WebGPU runners and the
+performance profiler. INT4, INT8, and floating-point dense weights are supported.
 
 #### 3. Run from a Prompt File with an Explicit Context Window
 
@@ -196,7 +227,7 @@ configuration without downloading or extracting multi-gigabyte weight files.
 
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `--model` | `"gemma4:12b"` | Model to profile: `gemma4:12b`, `gemma3:270m`, `gemma3:1b`, `qwen3:0.6b`, `qwen3:1.7b`, or `qwen3:8b`. |
+| `--model` | `"gemma4:12b"` | Model to profile: `gemma4:12b`, `gemma3:270m`, `gemma3:1b`, `qwen3:0.6b`, `qwen3:1.7b`, `qwen3:8b`, or `qwen3.5:0.8b`. |
 | `--phase` | `"all"` | Which inference graph(s) to profile: `all`, `decode`, `prefill`, or `greedy`. |
 | `--num_layers` | `0` | Override transformer layer count (`stack_size`). `0` uses the model's full layer count (`48` for `gemma4:12b`). Tip: use `--num_layers=6` on `gemma4:12b` to profile one complete 5-local + 1-global layer cycle in seconds. |
 | `--prefill_seq_len` | `64` | Sequence length for the prefill graph (clamped to `1024`). |

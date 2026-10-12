@@ -88,7 +88,7 @@
 // NOLINTBEGIN
 ABSL_FLAG(std::string, model, "gemma4:12b",
           "Model name to profile: gemma4:12b, gemma3:270m, gemma3:1b, "
-          "qwen3:0.6b, qwen3:1.7b, qwen3:8b.");
+          "qwen3:0.6b, qwen3:1.7b, qwen3:8b, qwen3.5:0.8b.");
 ABSL_FLAG(std::string, weights_path, "",
           "Optional path to extracted model weights directory. If empty, "
           "synthetic GPU weights are allocated for fast profiling.");
@@ -709,6 +709,7 @@ absl::Status BuildLlmGraphs(
           greedy_output_token_handle));
       return absl::OkStatus();
     }
+    case ModelType::kQwen35:
     case ModelType::kQwen3: {
       Qwen3ModelBuilder builder(config, gpu_info, create_info,
                                 std::move(tensor_loader));

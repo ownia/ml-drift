@@ -33,11 +33,7 @@ namespace ml_drift {
 constexpr float kMaxHalf = 65504.0f;
 
 #ifdef HAS_NATIVE_FP16
-#ifdef __clang__
 using half = __fp16;
-#else
-using half = _Float16;
-#endif  // __clang__
 #else
 struct alignas(2) half {
   half() = default;

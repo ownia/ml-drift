@@ -43,6 +43,18 @@ enum class ModelType {
   kGemma3,
   kGemma4,
   kQwen3,
+  kQwen35,
+};
+
+struct Qwen35Config {
+  int full_attention_interval = 4;
+  int linear_conv_kernel_dim = 4;
+  int linear_key_head_dim = 128;
+  int linear_num_key_heads = 16;
+  int linear_num_value_heads = 16;
+  int linear_value_head_dim = 128;
+  float rope_theta = 10000000.0f;
+  float partial_rotary_factor = 0.25f;
 };
 
 struct LlmConfig {
@@ -62,6 +74,7 @@ struct LlmConfig {
   std::optional<int> global_number_of_kv_heads;
   std::optional<int> local_ring_cache_size;
   std::optional<float> global_rope_proportion;
+  std::optional<Qwen35Config> qwen35;
 };
 
 inline int GetLocalRingCacheSize(const LlmConfig& config) {
@@ -196,6 +209,23 @@ inline LlmConfig GetQwen3ModelConfig8B() {
   };
 }
 
+inline LlmConfig GetQwen35ModelConfig0_8B() {
+  return LlmConfig{
+      .batch_size = 1,
+      .sequence_size = 1,
+      .model_dimension = 1024,
+      .hidden_dimension = 3584,
+      .head_dimension = 256,
+      .number_of_heads = 8,
+      .number_of_kv_heads = 2,
+      .vocabulary_size = 248320,
+      .stack_size = 24,
+      .num_local_layers_per_global = 0,
+      .sliding_window_size = 0,
+      .qwen35 = Qwen35Config{},
+  };
+}
+
 struct ModelInfo {
   ModelType type;
   LlmConfig config;
@@ -203,7 +233,8 @@ struct ModelInfo {
 };
 
 inline const char* GetTokenizerFilename(ModelType model_type) {
-  return (model_type == ModelType::kQwen3 || model_type == ModelType::kGemma4)
+  return (model_type == ModelType::kQwen3 || model_type == ModelType::kQwen35 ||
+          model_type == ModelType::kGemma4)
              ? "tokenizer.json"
              : "tokenizer.model";
 }
@@ -239,6 +270,11 @@ inline absl::StatusOr<ModelInfo> GetModelInfo(absl::string_view model_name) {
     return ModelInfo{
         .type = ModelType::kQwen3,
         .config = GetQwen3ModelConfig8B(),
+    };
+  } else if (model_name == "qwen3.5:0.8b") {
+    return ModelInfo{
+        .type = ModelType::kQwen35,
+        .config = GetQwen35ModelConfig0_8B(),
     };
   }
   return absl::InvalidArgumentError(

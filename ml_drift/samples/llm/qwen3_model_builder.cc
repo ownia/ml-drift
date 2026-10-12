@@ -560,7 +560,8 @@ void TransformQKVRmsNormRoPE(BuildContext& ctx, const TensorHandle& position,
       absl::StrCat(name, ".q_norm", kWeightSuffix), head_size);
   const float scale = 1.0f / std::sqrt(static_cast<float>(head_size));
   for (int i = 0; i < q_gamma.data.size(); ++i) {
-    q_gamma.data[i] = q_gamma.data[i] * scale;
+    q_gamma.data[i] =
+        (q_gamma.data[i] + (ctx.config.qwen35 ? 1.0f : 0.0f)) * scale;
   }
   TensorHandle q_gamma_tensor = ctx.AddConstantTensor(q_gamma, data_type);
 
@@ -568,6 +569,11 @@ void TransformQKVRmsNormRoPE(BuildContext& ctx, const TensorHandle& position,
   k_gamma.shape = ml_drift::Linear(head_size);
   k_gamma.data = ctx.loader->LoadFloat32(
       absl::StrCat(name, ".k_norm", kWeightSuffix), head_size);
+  if (ctx.config.qwen35) {
+    for (float& gamma : k_gamma.data) {
+      gamma += 1.0f;
+    }
+  }
   TensorHandle k_gamma_tensor = ctx.AddConstantTensor(k_gamma, data_type);
 
   std::string pow_func_name = "pow";
@@ -590,8 +596,11 @@ void TransformQKVRmsNormRoPE(BuildContext& ctx, const TensorHandle& position,
   int half_slices_count = args.q_dst.Slices() / 2;
   bool is_active = (DST_X < args.q_dst.Width() && DST_Y < args.q_dst.Height() && DST_S_GLOBAL < half_slices_count);
 
-  int DST_S0 = DST_S_GLOBAL;
-  int DST_S1 = DST_S_GLOBAL + half_slices_count;
+    int rotary_half_slices = args.rotary_dim / 8;
+    int DST_S0 = DST_S_GLOBAL < rotary_half_slices
+      ? DST_S_GLOBAL : DST_S_GLOBAL + rotary_half_slices;
+    int DST_S1 = DST_S_GLOBAL < rotary_half_slices
+      ? DST_S_GLOBAL + rotary_half_slices : DST_S_GLOBAL + half_slices_count;
 
   int batch_id = DST_Y / args.kv_heads_count;
   int kv_head_id = DST_Y % args.kv_heads_count;
@@ -685,7 +694,7 @@ void TransformQKVRmsNormRoPE(BuildContext& ctx, const TensorHandle& position,
 
     // 2. RoPE Constants
     float4 fraction;
-    float inv_q_dst_ch = 1.0f / ucl::Convert<float>(args.q_dst.Channels());
+    float inv_q_dst_ch = 1.0f / ucl::Convert<float>(args.rotary_dim);
     fraction.x = 2.0f * ucl::Convert<float>(DST_S_GLOBAL * 4 + 0) * inv_q_dst_ch;
     fraction.y = 2.0f * ucl::Convert<float>(DST_S_GLOBAL * 4 + 1) * inv_q_dst_ch;
     fraction.z = 2.0f * ucl::Convert<float>(DST_S_GLOBAL * 4 + 2) * inv_q_dst_ch;
@@ -705,6 +714,10 @@ void TransformQKVRmsNormRoPE(BuildContext& ctx, const TensorHandle& position,
           "(sinusoid_inp));\n";
 
   code += R"(
+    if (DST_S_GLOBAL >= args.rotary_dim / 8) {
+      sin_val = ucl::Init<Type>(0.0f);
+      cos_val = ucl::Init<Type>(1.0f);
+    }
     Type val0_t = ucl::Convert<Type>(val0);
     Type val1_t = ucl::Convert<Type>(val1);
     Type q_out0 = val0_t * cos_val - val1_t * sin_val;
@@ -789,6 +802,11 @@ void TransformQKVRmsNormRoPE(BuildContext& ctx, const TensorHandle& position,
   custom_op.args_.AddInt("kv_head_group_size", kv_head_group_size);
   custom_op.args_.AddInt("sequence_size", ctx.sequence_size);
   custom_op.args_.AddInt("cache_size", ctx.config.cache_size);
+  custom_op.args_.AddInt(
+      "rotary_dim", ctx.config.qwen35
+                        ? static_cast<int>(head_size *
+                                           ctx.config.qwen35->partial_rotary_factor)
+                        : head_size);
   custom_op.args_.AddFloat("min_timescale", min_timescale);
   custom_op.args_.AddFloat("max_timescale", max_timescale);
   custom_op.work_group_size_ = int3(1, 1, head_size / 8);
@@ -839,14 +857,14 @@ GPUOperation CreateSiluMulOp(const TensorDescriptor& gate_desc,
                              const TensorDescriptor& up_desc,
                              const TensorDescriptor& dst_desc) {
   ElementwiseDescriptor op_desc;
-  op_desc.code = R"(
+  op_desc.code = absl::Substitute(R"(
       float4 gate_f32 = ucl::Convert<float4>(in_value);
       float4 up_f32 = ucl::Convert<float4>(in2_value);
       float4 sig_val = 1.0f / (1.0f + exp(-gate_f32));
       float4 silu_val = gate_f32 * sig_val;
       float4 res_f32 = clamp(silu_val * up_f32, ucl::Init<float4>(-65504.0f), ucl::Init<float4>(65504.0f));
-      out_value = ucl::Convert<args.dst_tensor::type>(res_f32);
-  )";
+      out_value = ucl::Convert<$0>(res_f32);
+  )", ToUclDataType(dst_desc.GetDataType(), 4));
   OperationDef definition;
   definition.src_tensors.push_back(gate_desc);
   definition.src_tensors.push_back(up_desc);
@@ -919,6 +937,287 @@ TensorHandle FFLayer(BuildContext& ctx, const TensorHandle& src,
                 ctx.config.model_dimension);
 }
 
+TensorHandle CausalConv(BuildContext& ctx, const TensorHandle& src,
+                        const TensorHandle& history, const std::string& name) {
+  const int kernel_size = ctx.config.qwen35->linear_conv_kernel_dim;
+  const int channels = src.tensor_desc.GetBHWCShape().c;
+  const auto data = ctx.loader->LoadFloat32(
+      absl::StrCat(name, ".conv1d", kWeightSuffix), channels * kernel_size);
+  ABSL_CHECK_EQ(data.size(), channels * kernel_size);
+  ml_drift::Tensor<ml_drift::Linear, DataType::kFloat32> weights;
+  weights.shape = ml_drift::Linear(channels * kernel_size);
+  weights.data.resize(channels * kernel_size);
+  for (int channel = 0; channel < channels; ++channel) {
+    for (int tap = 0; tap < kernel_size; ++tap) {
+      weights.data[tap * channels + channel] = data[channel * kernel_size + tap];
+    }
+  }
+  TensorHandle weights_handle = ctx.AddConstantTensor(weights, DataType::kFloat32);
+  TensorHandle dst = ctx.AddTensor(src.tensor_desc);
+  class CausalConvOp : public GPUOperation {
+   public:
+    int3 GetGridSize() const override {
+      return int3(dst_[0]->Slices(), dst_[0]->Batch(), 1);
+    }
+  };
+  CausalConvOp op;
+  op.AddSrcTensor("src", src.tensor_desc);
+  op.AddSrcTensor("history", history.tensor_desc);
+  op.AddSrcTensor("weights", weights_handle.tensor_desc);
+  BufferDescriptor params_desc;
+  params_desc.element_type = DataType::kInt32;
+  params_desc.element_size = 1;
+  op.AddSrcBuffer("params", params_desc);
+  op.AddDstTensor("dst", dst.tensor_desc);
+  op.AddDstTensor("history_dst", history.tensor_desc);
+  op.args_.AddInt("kernel_size", kernel_size);
+  op.code_ = absl::Substitute(R"(
+MAIN_FUNCTION($$0) {
+  int slice = ucl::GetGlobalId<0>();
+  int batch = ucl::GetGlobalId<1>();
+  if (slice >= args.dst.Slices() || batch >= args.dst.Batch()) {
+    return;
+  }
+  args.src.SetBatchRef(batch);
+  args.history.SetBatchRef(batch);
+  args.dst.SetBatchRef(batch);
+  args.history_dst.SetBatchRef(batch);
+  int offset = args.params.Read($1);
+  int active_tokens = args.params.Read($2);
+  float4 history_values[$0];
+  for (int tap = 0; tap < args.kernel_size - 1; ++tap) {
+    history_values[tap] = ucl::Init<float4>(0.0f);
+    if (offset > 0) {
+      history_values[tap] = args.history.Read<float>(tap, 0, slice);
+    }
+  }
+  for (int token = 0; token < args.src.Width(); ++token) {
+    if (offset + token >= active_tokens) {
+      break;
+    }
+    float4 value = args.src.Read<float>(token, 0, slice);
+    float4 result = value * args.weights.Read<float>(
+        (args.kernel_size - 1) * args.dst.Slices() + slice);
+    for (int tap = 0; tap < args.kernel_size - 1; ++tap) {
+      result += history_values[tap] * args.weights.Read<float>(
+          tap * args.dst.Slices() + slice);
+    }
+    for (int tap = 0; tap < args.kernel_size - 2; ++tap) {
+      history_values[tap] = history_values[tap + 1];
+    }
+    history_values[args.kernel_size - 2] = value;
+    result = result / (1.0f + exp(-result));
+    args.dst.Write(ucl::Convert<args.dst::type>(result), token, 0, slice);
+  }
+  for (int tap = 0; tap < args.kernel_size - 1; ++tap) {
+    args.history_dst.Write(
+        ucl::Convert<args.history_dst::type>(history_values[tap]), tap, 0, slice);
+  }
+}
+)", kernel_size - 1, LlmRuntimeParams::kTokenOffsetIndex,
+       LlmRuntimeParams::kActiveTokensIndex);
+  ctx.AddGpuOperation({src, history, weights_handle, ctx.params_i32},
+                      {dst, history},
+                      std::make_unique<CausalConvOp>(std::move(op)),
+                      "qwen35_causal_conv");
+  return dst;
+}
+
+TensorHandle GatedDeltaRule(BuildContext& ctx, const TensorHandle& qkv,
+                            const TensorHandle& gate_a,
+                            const TensorHandle& gate_b,
+                            const TensorHandle& state,
+                            const std::string& name) {
+  const auto& config = *ctx.config.qwen35;
+  const int key_dim = config.linear_key_head_dim;
+  const int value_dim = config.linear_value_head_dim;
+  const int value_heads = config.linear_num_value_heads;
+  const int key_heads = config.linear_num_key_heads;
+  ml_drift::Tensor<ml_drift::Linear, DataType::kFloat32> a_log, dt_bias;
+  a_log.shape = ml_drift::Linear(value_heads);
+  a_log.data = ctx.loader->LoadFloat32(absl::StrCat(name, ".A_log.bin"),
+                                      value_heads);
+  dt_bias.shape = ml_drift::Linear(value_heads);
+  dt_bias.data = ctx.loader->LoadFloat32(absl::StrCat(name, ".dt_bias.bin"),
+                                        value_heads);
+  TensorHandle a_log_handle = ctx.AddConstantTensor(a_log, DataType::kFloat32);
+  TensorHandle dt_bias_handle = ctx.AddConstantTensor(dt_bias, DataType::kFloat32);
+  TensorHandle dst = ctx.AddTensor(ctx.config.batch_size, value_heads,
+                                   ctx.sequence_size, value_dim, ctx.data_type());
+  class GatedDeltaRuleOp : public GPUOperation {
+   public:
+    int3 GetGridSize() const override {
+      return int3(dst_[0]->Slices(), dst_[0]->Height() * dst_[0]->Batch(), 1);
+    }
+    std::vector<int3> GetPossibleKernelWorkGroups(
+        TuningType tuning_type, const GpuInfo& gpu_info,
+        const KernelInfo& kernel_info) const override {
+      return {work_group_size_};
+    }
+  };
+  GatedDeltaRuleOp op;
+  op.work_group_size_ = int3(value_dim / 4, 1, 1);
+  op.AddSrcTensor("qkv", qkv.tensor_desc);
+  op.AddSrcTensor("gate_a", gate_a.tensor_desc);
+  op.AddSrcTensor("gate_b", gate_b.tensor_desc);
+  op.AddSrcTensor("a_log", a_log_handle.tensor_desc);
+  op.AddSrcTensor("dt_bias", dt_bias_handle.tensor_desc);
+  op.AddSrcTensor("state", state.tensor_desc);
+  BufferDescriptor params_desc;
+  params_desc.element_type = DataType::kInt32;
+  params_desc.element_size = 1;
+  op.AddSrcBuffer("params", params_desc);
+  op.AddDstTensor("dst", dst.tensor_desc);
+  op.AddDstTensor("state_dst", state.tensor_desc);
+  op.args_.AddInt("key_dim", key_dim);
+  op.args_.AddInt("key_heads", key_heads);
+  op.args_.AddInt("value_heads", value_heads);
+  op.args_.AddFloat("query_scale", 1.0f / std::sqrt(static_cast<float>(key_dim)));
+  op.code_ = absl::Substitute(R"(
+MAIN_FUNCTION($$0) {
+  int slice = ucl::GetLocalId<0>();
+  int head_index = ucl::GetGlobalId<1>();
+  int head = head_index % args.value_heads;
+  int batch = head_index / args.value_heads;
+  int key_head = head / (args.value_heads / args.key_heads);
+  args.qkv.SetBatchRef(batch);
+  args.gate_a.SetBatchRef(batch);
+  args.gate_b.SetBatchRef(batch);
+  args.dst.SetBatchRef(batch);
+  int offset = args.params.Read($3);
+  int active_tokens = args.params.Read($4);
+  float4 state_values[$0];
+  for (int row = 0; row < args.key_dim; ++row) {
+    state_values[row] = ucl::Init<float4>(0.0f);
+    if (offset > 0) {
+      state_values[row] = args.state.Read<float>(row, head_index, slice);
+    }
+  }
+  __local float4 queries[$1];
+  __local float4 keys[$1];
+  __local float query_sums[$2];
+  __local float key_sums[$2];
+  float a_log;
+  float dt_bias;
+  args.a_log.ReadPerChannel(a_log, head);
+  args.dt_bias.ReadPerChannel(dt_bias, head);
+  for (int token = 0; token < args.dst.Width(); ++token) {
+    if (offset + token >= active_tokens) {
+      break;
+    }
+    float query_sum = 0.0f;
+    float key_sum = 0.0f;
+    for (int key_slice = slice; key_slice < $1; key_slice += $2) {
+      int query_slice = key_head * $1 + key_slice;
+      float4 query = args.qkv.Read<float>(token, 0, query_slice);
+      float4 key = args.qkv.Read<float>(token, 0, args.key_heads * $1 + query_slice);
+      queries[key_slice] = query;
+      keys[key_slice] = key;
+      query_sum += dot(query, query);
+      key_sum += dot(key, key);
+    }
+    query_sums[slice] = query_sum;
+    key_sums[slice] = key_sum;
+    ucl::SyncThreads<WorkGroup, Local>();
+    int reduction_size = $2;
+    while (reduction_size > 1) {
+      int limit = reduction_size / 2;
+      int reduction_offset = (reduction_size + 1) / 2;
+      if (slice < limit) {
+        query_sums[slice] += query_sums[slice + reduction_offset];
+        key_sums[slice] += key_sums[slice + reduction_offset];
+      }
+      ucl::SyncThreads<WorkGroup, Local>();
+      reduction_size = reduction_offset;
+    }
+    float query_scale = rsqrt(query_sums[0] + 1e-6f) * args.query_scale;
+    float key_scale = rsqrt(key_sums[0] + 1e-6f);
+    float gate_a;
+    float gate_b;
+    args.gate_a.ReadPerChannel<float>(gate_a, token, 0, head);
+    args.gate_b.ReadPerChannel<float>(gate_b, token, 0, head);
+    float step = gate_a + dt_bias;
+    float softplus = max(step, 0.0f) + log(1.0f + exp(-fabs(step)));
+    float decay = exp(-exp(a_log) * softplus);
+    float beta = 1.0f / (1.0f + exp(-gate_b));
+    float4 predicted = ucl::Init<float4>(0.0f);
+    for (int row = 0; row < args.key_dim; ++row) {
+      state_values[row] *= decay;
+      float4 key_vector = keys[row / 4];
+      int component = row % 4;
+      float key = (component == 0 ? key_vector.x :
+           component == 1 ? key_vector.y :
+           component == 2 ? key_vector.z : key_vector.w) * key_scale;
+      predicted += state_values[row] * key;
+    }
+    float4 value = args.qkv.Read<float>(
+        token, 0, 2 * args.key_heads * $1 + head * $2 + slice);
+    float4 delta = (value - predicted) * beta;
+    float4 output_value = ucl::Init<float4>(0.0f);
+    for (int row = 0; row < args.key_dim; ++row) {
+      float4 key_vector = keys[row / 4];
+      float4 query_vector = queries[row / 4];
+      int component = row % 4;
+      float key = (component == 0 ? key_vector.x :
+           component == 1 ? key_vector.y :
+           component == 2 ? key_vector.z : key_vector.w) * key_scale;
+      float query = (component == 0 ? query_vector.x :
+             component == 1 ? query_vector.y :
+             component == 2 ? query_vector.z : query_vector.w) * query_scale;
+      state_values[row] += key * delta;
+      output_value += state_values[row] * query;
+    }
+    args.dst.Write(ucl::Convert<args.dst::type>(output_value), token, head, slice);
+    ucl::SyncThreads<WorkGroup, Local>();
+  }
+  for (int row = 0; row < args.key_dim; ++row) {
+    args.state_dst.Write(state_values[row], row, head_index, slice);
+  }
+}
+)", key_dim, key_dim / 4, value_dim / 4,
+       LlmRuntimeParams::kTokenOffsetIndex, LlmRuntimeParams::kActiveTokensIndex);
+  ctx.AddGpuOperation(
+      {qkv, gate_a, gate_b, a_log_handle, dt_bias_handle, state, ctx.params_i32},
+      {dst, state}, std::make_unique<GatedDeltaRuleOp>(std::move(op)),
+      "qwen35_gated_delta_rule");
+  return dst;
+}
+
+TensorHandle LinearAttention(BuildContext& ctx, const TensorHandle& src,
+                             const std::string& name,
+                             const TensorHandle& conv_state,
+                             const TensorHandle& recurrent_state) {
+  const auto& config = *ctx.config.qwen35;
+  const int key_channels = config.linear_num_key_heads * config.linear_key_head_dim;
+  const int value_channels =
+      config.linear_num_value_heads * config.linear_value_head_dim;
+  TensorHandle qkv = Linear(ctx, src, absl::StrCat(name, ".in_proj_qkv"),
+                             2 * key_channels + value_channels);
+  TensorHandle gate_a = Linear(ctx, src, absl::StrCat(name, ".in_proj_a"),
+                                config.linear_num_value_heads);
+  TensorHandle gate_b = Linear(ctx, src, absl::StrCat(name, ".in_proj_b"),
+                                config.linear_num_value_heads);
+  TensorHandle gate_z = Linear(ctx, src, absl::StrCat(name, ".in_proj_z"),
+                                value_channels);
+  qkv = CausalConv(ctx, qkv, conv_state, name);
+  TensorHandle attn = GatedDeltaRule(ctx, qkv, gate_a, gate_b, recurrent_state, name);
+  ml_drift::Tensor<ml_drift::Linear, DataType::kFloat32> gamma;
+  gamma.shape = ml_drift::Linear(config.linear_value_head_dim);
+  gamma.data = ctx.loader->LoadFloat32(absl::StrCat(name, ".norm", kWeightSuffix),
+                                       config.linear_value_head_dim);
+  attn = ctx.RMSNormalization(attn, 1e-6f, &gamma);
+  gate_z = ctx.Reshape(
+      gate_z, BHWC(ctx.config.batch_size, ctx.sequence_size,
+                   config.linear_num_value_heads, config.linear_value_head_dim));
+  gate_z = ctx.Transpose(gate_z, BHWC(0, 2, 1, 3));
+  attn = SiluMul(ctx, gate_z, attn);
+  attn = ctx.Transpose(attn, BHWC(0, 2, 1, 3));
+  attn = ctx.Reshape(attn, BHWC(ctx.config.batch_size, 1, ctx.sequence_size,
+                               value_channels));
+  return Linear(ctx, attn, absl::StrCat(name, ".out_proj"),
+                ctx.config.model_dimension);
+}
+
 // Multi-Head Attention (MHA / GQA) Block:
 //   1. Project input to Q, K, and V (.q_proj, .k_proj, .v_proj)
 //   2. Apply Rotary Position Embedding (RoPE) and per-head RMSNorms
@@ -936,12 +1235,28 @@ TensorHandle SelfAttention(BuildContext& ctx, const TensorHandle& src,
   const int kv_channels =
       ctx.config.head_dimension * ctx.config.number_of_kv_heads;
 
-  TensorHandle q = Linear(ctx, src, absl::StrCat(name, ".q_proj"), q_channels);
+  TensorHandle q = Linear(ctx, src, absl::StrCat(name, ".q_proj"),
+                          q_channels * (ctx.config.qwen35 ? 2 : 1));
+  TensorHandle gate;
+  if (ctx.config.qwen35) {
+    const int head_size = ctx.config.head_dimension;
+    const BHWC split_shape(ctx.config.batch_size, ctx.sequence_size,
+                           ctx.config.number_of_heads, head_size);
+    q = ctx.Reshape(q, BHWC(ctx.config.batch_size, ctx.sequence_size,
+                           ctx.config.number_of_heads, head_size * 2));
+    gate = ctx.Slice(q, BHWC(0, 0, 0, head_size), split_shape);
+    q = ctx.Slice(q, BHWC(0, 0, 0, 0), split_shape);
+    const BHWC projection_shape(ctx.config.batch_size, 1, ctx.sequence_size,
+                                q_channels);
+    q = ctx.Reshape(q, projection_shape);
+    gate = ctx.Reshape(gate, projection_shape);
+  }
   TensorHandle k = Linear(ctx, src, absl::StrCat(name, ".k_proj"), kv_channels);
   TensorHandle v = Linear(ctx, src, absl::StrCat(name, ".v_proj"), kv_channels);
 
   float min_timescale = 1.0f;
-  float max_timescale = 1000000.0f;
+  float max_timescale =
+      ctx.config.qwen35 ? ctx.config.qwen35->rope_theta : 1000000.0f;
 
   if (ctx.config.head_dimension % 8 == 0) {
     // Also updates the KV cache.
@@ -1013,6 +1328,27 @@ TensorHandle SelfAttention(BuildContext& ctx, const TensorHandle& src,
   attn = ctx.Reshape(
       attn, BHWC{batch_size, 1, ctx.sequence_size, heads_count * head_size});
 
+  if (ctx.config.qwen35) {
+    TensorHandle gated = ctx.AddTensor(attn.tensor_desc);
+    ElementwiseDescriptor gate_desc;
+    gate_desc.code = absl::Substitute(R"(
+      float4 gate_f32 = ucl::Convert<float4>(in2_value);
+      float4 value_f32 = ucl::Convert<float4>(in_value);
+      out_value = ucl::Convert<$0>(
+          value_f32 / (1.0f + exp(-gate_f32)));
+    )", ToUclDataType(gated.tensor_desc.GetDataType(), 4));
+    OperationDef definition;
+    definition.src_tensors = {attn.tensor_desc, gate.tensor_desc};
+    definition.dst_tensors = {gated.tensor_desc};
+    ctx.AddGpuOperation(
+        {attn, gate}, {gated},
+        std::make_unique<GPUOperation>(CreateGpuOperation(
+            definition, std::move(gate_desc), gate.tensor_desc.GetBHWCShape(),
+            gated.tensor_desc.GetBHWCShape())),
+        "attention_output_gate");
+    attn = gated;
+  }
+
   return Linear(ctx, attn, absl::StrCat(name, ".o_proj"),
                 ctx.config.model_dimension);
 }
@@ -1029,15 +1365,24 @@ TensorHandle TransformerLayer(BuildContext& ctx, const TensorHandle& src,
   TensorHandle residual = src;
 
   // 1. Attention Block
-  TensorHandle x = RMSNorm(ctx, src, absl::StrCat(name, ".input_layernorm"));
-  x = SelfAttention(ctx, x, attention_mask, position_ids,
-                    absl::StrCat(name, ".self_attn"), layer_i, k_cache_in,
-                    v_cache_in);
+  const float scale_shift = ctx.config.qwen35 ? 1.0f : 0.0f;
+  TensorHandle x = RMSNorm(ctx, src, absl::StrCat(name, ".input_layernorm"),
+                            scale_shift);
+  if (ctx.config.qwen35 &&
+      (layer_i + 1) % ctx.config.qwen35->full_attention_interval != 0) {
+    x = LinearAttention(ctx, x, absl::StrCat(name, ".linear_attn"), k_cache_in,
+                        v_cache_in);
+  } else {
+    x = SelfAttention(ctx, x, attention_mask, position_ids,
+                      absl::StrCat(name, ".self_attn"), layer_i, k_cache_in,
+                      v_cache_in);
+  }
   x = ctx.Add(residual, x);
 
   // 2. Feed-Forward / MLP Block
   residual = x;
-  x = RMSNorm(ctx, x, absl::StrCat(name, ".post_attention_layernorm"));
+  x = RMSNorm(ctx, x, absl::StrCat(name, ".post_attention_layernorm"),
+               scale_shift);
   TensorHandle mlp_output = FFLayer(ctx, x, name);
   return ctx.Add(residual, mlp_output);
 }
@@ -1118,8 +1463,22 @@ void Qwen3ModelBuilder::CreateKVCache(
   v_caches_in_handles->resize(config_.stack_size);
 
   for (int i = 0; i < config_.stack_size; ++i) {
-    (*k_caches_in_handles)[i] = model_builder_.AddTensor(k_desc);
-    (*v_caches_in_handles)[i] = model_builder_.AddTensor(v_desc);
+    if (config_.qwen35 &&
+        (i + 1) % config_.qwen35->full_attention_interval != 0) {
+      const auto& config = *config_.qwen35;
+      const int channels = 2 * config.linear_num_key_heads * config.linear_key_head_dim +
+                           config.linear_num_value_heads * config.linear_value_head_dim;
+      (*k_caches_in_handles)[i] = model_builder_.AddTensor(
+          BHWC(config_.batch_size, 1, config.linear_conv_kernel_dim - 1, channels),
+          cache_dt);
+      (*v_caches_in_handles)[i] = model_builder_.AddTensor(
+          BHWC(1, config_.batch_size * config.linear_num_value_heads,
+               config.linear_key_head_dim, config.linear_value_head_dim),
+          DataType::kFloat32);
+    } else {
+      (*k_caches_in_handles)[i] = model_builder_.AddTensor(k_desc);
+      (*v_caches_in_handles)[i] = model_builder_.AddTensor(v_desc);
+    }
   }
 }
 
@@ -1153,7 +1512,7 @@ absl::Status Qwen3ModelBuilder::BuildModelInternal(
   }
 
   // 4. Final Normalization
-  x = RMSNorm(ctx, x, "model.norm");
+  x = RMSNorm(ctx, x, "model.norm", config_.qwen35 ? 1.0f : 0.0f);
 
   // Slice out the last token hidden state before the LM head projection during
   // prefill to avoid projecting all prompt tokens to vocabulary logits.
@@ -1202,6 +1561,20 @@ absl::Status Qwen3ModelBuilder::Build(
     GpuModelBuilder::TensorHandle* decode_output_handle,
     std::vector<GpuModelBuilder::TensorHandle>* k_caches_in_handles,
     std::vector<GpuModelBuilder::TensorHandle>* v_caches_in_handles) {
+  if (config_.qwen35) {
+    const auto& config = *config_.qwen35;
+    const int rotary_dim =
+        static_cast<int>(config_.head_dimension * config.partial_rotary_factor);
+    if (config.full_attention_interval < 1 || config.linear_conv_kernel_dim < 2 ||
+        config.linear_key_head_dim < 4 || config.linear_key_head_dim % 4 != 0 ||
+        config.linear_value_head_dim < 4 || config.linear_value_head_dim % 4 != 0 ||
+        config.linear_num_key_heads < 1 || config.linear_num_value_heads < 1 ||
+        config.linear_num_value_heads % config.linear_num_key_heads != 0 ||
+        config_.head_dimension % 8 != 0 || rotary_dim < 8 || rotary_dim % 8 != 0 ||
+        rotary_dim > config_.head_dimension) {
+      return absl::InvalidArgumentError("Invalid Qwen3.5 attention dimensions");
+    }
+  }
   // Create shared KV cache tensors
   CreateKVCache(k_caches_in_handles, v_caches_in_handles);
 

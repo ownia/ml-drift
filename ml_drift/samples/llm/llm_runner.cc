@@ -37,7 +37,7 @@ ABSL_FLAG(std::string, prompt_file, "",
 ABSL_FLAG(int, max_gen_tokens, 512, "Max number of tokens to generate.");
 ABSL_FLAG(std::string, model, "none",
           "Which model to run. gemma3:1b, gemma3:270m, gemma4:12b, qwen3:0.6b, "
-          "qwen3:1.7b, qwen3:8b");
+          "qwen3:1.7b, qwen3:8b, qwen3.5:0.8b");
 ABSL_FLAG(std::string, weights_path, "",
           "Path to the extracted weights (+tokenizer).");
 ABSL_FLAG(std::string, tokenizer_path, "",

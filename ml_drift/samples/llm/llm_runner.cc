@@ -51,6 +51,9 @@ ABSL_FLAG(int, context_window_size, 0,
 ABSL_FLAG(bool, benchmark, false,
           "If true, overrides prompt and runs model with speed benchmarks, and "
           "shows timing info.");
+ABSL_FLAG(bool, stats, false,
+          "Print wall-clock timing and throughput for real-prompt OpenCL "
+          "inference. Cannot be combined with --benchmark.");
 ABSL_FLAG(int, benchmark_prefill_tokens, 512,
           "Number of prefill tokens to benchmark.");
 ABSL_FLAG(int, benchmark_decode_tokens, 128,
@@ -77,6 +80,11 @@ int main(int argc, char** argv) {
     prompt = *std::move(prompt_content);
   }
   const bool benchmark = absl::GetFlag(FLAGS_benchmark);
+  if (benchmark && absl::GetFlag(FLAGS_stats)) {
+    ABSL_LOG(ERROR) << "--stats is for real-prompt inference and cannot be "
+                      "combined with --benchmark.";
+    return 1;
+  }
   if (prompt.empty() && !benchmark) {
     ABSL_LOG(ERROR) << "Usage: " << argv[0]
                     << " --model=<model_name> --weights_path=<path_to_weights>"

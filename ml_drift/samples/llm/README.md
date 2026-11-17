@@ -109,6 +109,7 @@ converts and quantizes them into separate binary tensor files for ML Drift.
 | `--prompt_file` | `""` | Path to a text file containing the input prompt (overrides `--prompt`). |
 | `--max_gen_tokens` | `512` | Maximum number of output tokens to generate during interactive decoding. |
 | `--context_window_size` | `0` | Context window / KV cache size (`cache_size` in `LlmConfig`). If `0`, automatically set to `(# input tokens + max_gen_tokens)` rounded up to a multiple of 256. |
+| `--stats` | `false` | OpenCL only. Print wall-clock timing and throughput for the real prompt after generation. Cannot be combined with `--benchmark`. |
 | `--benchmark` | `false` | If `true`, overrides `--prompt` and runs synthetic token prefill and decode throughput benchmarks with timing output. |
 | `--benchmark_prefill_tokens` | `512` | Number of input tokens to prefill when `--benchmark=true`. |
 | `--benchmark_decode_tokens` | `128` | Number of output tokens to decode when `--benchmark=true`. |
@@ -138,7 +139,8 @@ bazel run -c opt //ml_drift/samples/llm:llm_runner_webgpu -- \
 bazel run -c opt //ml_drift/samples/llm:llm_runner_opencl -- \
   --model=qwen3:0.6b \
   --weights_path=/tmp/extracted/ \
-  --prompt="Write a haiku about coffee."
+  --prompt="Write a haiku about coffee." \
+  --stats
 ```
 
 #### 3. Run from a Prompt File with an Explicit Context Window

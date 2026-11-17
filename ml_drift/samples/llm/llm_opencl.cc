@@ -61,6 +61,7 @@
 #include "ml_drift/samples/llm/qwen3_model_builder.h"
 
 ABSL_DECLARE_FLAG(std::string, model);
+ABSL_DECLARE_FLAG(bool, stats);
 
 namespace ml_drift {
 
@@ -598,17 +599,61 @@ absl::Status OpenCLLlmModelRunner::Decode(const DecodeOptions& options) {
 absl::Status OpenCLLlmModelRunner::PostProcessGreedy(
     Tokenizer& tokenizer, const std::vector<int>& input_tokens_vec,
     int num_gen_tokens, std::vector<int>& output_tokens_vec) {
+  const bool show_stats = absl::GetFlag(FLAGS_stats);
+  const size_t initial_output_size = output_tokens_vec.size();
+  size_t decode_tokens = 0;
+  double prefill_duration_s = 0.0;
+  double decode_duration_s = 0.0;
+  absl::Time prefill_start;
+  const auto print_stats = [&]() {
+    if (!show_stats) {
+      return;
+    }
+    const double total_duration_s =
+        absl::ToDoubleSeconds(absl::Now() - prefill_start);
+    const size_t generated_tokens =
+        output_tokens_vec.size() - initial_output_size;
+    ABSL_LOG(INFO) << "Real-prompt stats (wall-clock, excluding model "
+                      "initialization):";
+    ABSL_LOG(INFO) << "Input tokens: " << input_tokens_vec.size()
+                   << ", Generated tokens: " << generated_tokens
+                   << ", Decode tokens: " << decode_tokens;
+    ABSL_LOG(INFO) << "TTFT: " << prefill_duration_s * 1000.0 << " ms";
+    ABSL_LOG(INFO) << "Prefill TPS: "
+                   << (prefill_duration_s > 0.0
+                           ? input_tokens_vec.size() / prefill_duration_s
+                           : 0.0);
+    ABSL_LOG(INFO) << "Decode time: " << decode_duration_s * 1000.0 << " ms";
+    ABSL_LOG(INFO) << "Decode TPS: "
+                   << (decode_duration_s > 0.0
+                           ? decode_tokens / decode_duration_s
+                           : 0.0);
+    ABSL_LOG(INFO) << "ITL (ms/tok) - Avg: "
+                   << (decode_tokens > 0
+                           ? decode_duration_s * 1000.0 / decode_tokens
+                           : 0.0);
+    ABSL_LOG(INFO) << "Total inference time: " << total_duration_s * 1000.0
+                   << " ms";
+  };
+
   // 1. Prefill Step: Process all prompt input tokens on the GPU.
   ABSL_LOG(INFO) << "Running prefill...";
   int first_token = 0;
+  if (show_stats) {
+    prefill_start = absl::Now();
+  }
   ABSL_RETURN_IF_ERROR(
       Prefill(input_tokens_vec, /*download_token=*/true, &first_token))
       << "Error during prefill";
+  if (show_stats) {
+    prefill_duration_s = absl::ToDoubleSeconds(absl::Now() - prefill_start);
+  }
   output_tokens_vec.push_back(first_token);
 
   if (num_gen_tokens <= 1) {
     std::cout << tokenizer.DecodeOutputTokens({first_token}) << std::flush;
     std::cout << std::endl;
+    print_stats();
     return absl::OkStatus();
   }
 
@@ -624,8 +669,15 @@ absl::Status OpenCLLlmModelRunner::PostProcessGreedy(
   options.check_eos = true;
   options.tokenizer = &tokenizer;
   options.output_tokens = &output_tokens_vec;
+  const size_t decode_output_start = output_tokens_vec.size();
+  const absl::Time decode_start = show_stats ? absl::Now() : absl::Time();
   ABSL_RETURN_IF_ERROR(Decode(options));
+  if (show_stats) {
+    decode_duration_s = absl::ToDoubleSeconds(absl::Now() - decode_start);
+    decode_tokens = output_tokens_vec.size() - decode_output_start;
+  }
   std::cout << std::endl;
+  print_stats();
 
   return absl::OkStatus();
 }
